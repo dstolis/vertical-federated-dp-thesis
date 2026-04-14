@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adaptive_dp_vfl"
+version = "0.2.0"
+description = "Adaptive Differentially Private Vertical Federated Learning on Flower"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flwr[simulation]>=1.13.0",
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "matplotlib>=3.8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["adaptive_dp_vfl"]
+
+[tool.flwr.app]
+publisher = "dionstol"
+
+[tool.flwr.app.components]
+serverapp = "adaptive_dp_vfl.server_app:app"
+clientapp = "adaptive_dp_vfl.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 20
+dataset = "mnist"
+mode = "adaptive"
+noise-multiplier = 1.0
+clipping-norm = 1.0
+target-quantile = 0.5
+clip-norm-lr = 0.01
+min-clipping-norm = 0.01
+max-clipping-norm = 100.0
+initial-lr = 1e-3
+min-lr = 1e-5
+max-lr = 1e-2
+initial-local-epochs = 1
+min-local-epochs = 1
+max-local-epochs = 5
+patience = 2
+min-improve = 0.01
+batch-size = 64
+embedding-dim = 64
+seed = 42
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 2

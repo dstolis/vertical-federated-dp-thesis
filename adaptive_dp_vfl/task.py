@@ -1,0 +1,154 @@
+"""Per-party training state shared by the Flower client and the simulation runner.
+
+A ``PartyState`` bundles together the bottom model, its optimiser, a per-party
+data iterator, and the embedding-level privacy manager. The Flower client and
+the standalone simulation runner both drive the same ``PartyState``, so that
+the code paths exercised by the two entrypoints are identical.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Iterator, Tuple
+
+import torch
+from torch import nn
+
+from .data import get_dataloaders
+from .models import BottomNet, TopNet, set_lr
+from .privacy import AdaptivePrivacyManager, PrivacyConfig
+
+
+@dataclass
+class RunConfig:
+    dataset: str = "mnist"
+    mode: str = "adaptive"                 # "baseline" | "dp" | "adaptive"
+    # Privacy
+    noise_multiplier: float = 1.0
+    clipping_norm: float = 1.0
+    # Under LayerNorm, ||e||_2 ~ sqrt(d) ~ 8 is stable. Track the MEDIAN IR
+    # norm rather than the 90th percentile so sigma = z*C stays moderate
+    # while C still has room to float around its natural scale. v5a erred by
+    # also pinning max_clipping_norm=5, which slammed the warmup-initialised
+    # C into the ceiling and killed adaptation; v5b restores max_clipping=20.
+    target_quantile: float = 0.5        # track the median, not the tail
+    clip_norm_lr: float = 0.2           # per-ROUND update rate
+    min_clipping_norm: float = 0.01
+    max_clipping_norm: float = 20.0     # headroom above sqrt(d) ~ 8
+    max_sigma: float = 10.0             # hard cap on injected noise std
+    # Tuner
+    initial_lr: float = 1e-3
+    min_lr: float = 1e-5
+    max_lr: float = 1e-2
+    initial_local_epochs: int = 1
+    min_local_epochs: int = 1
+    max_local_epochs: int = 5
+    patience: int = 2
+    min_improve: float = 0.01
+    tuner_warmup_rounds: int = 3        # let DP loss stabilise before adapting
+    # General
+    batch_size: int = 64
+    embedding_dim: int = 64
+    num_rounds: int = 40                # DP needs longer than non-private run
+    seed: int = 42
+
+    @property
+    def dp_enabled(self) -> bool:
+        return self.mode in ("dp", "adaptive")
+
+    @property
+    def adaptive_enabled(self) -> bool:
+        return self.mode == "adaptive"
+
+
+class PartyState:
+    """Bottom-model state for a single VFL party."""
+
+    def __init__(self, party_id: int, input_width: int, cfg: RunConfig, device: torch.device):
+        self.party_id = party_id
+        self.cfg = cfg
+        self.device = device
+        self.bottom = BottomNet(input_width=input_width, embedding_dim=cfg.embedding_dim).to(device)
+        self.optim = torch.optim.Adam(self.bottom.parameters(), lr=cfg.initial_lr)
+        pcfg = PrivacyConfig(
+            noise_multiplier=cfg.noise_multiplier if cfg.dp_enabled else 0.0,
+            clipping_norm=cfg.clipping_norm,
+            adaptive=cfg.adaptive_enabled,
+            target_quantile=cfg.target_quantile,
+            clip_norm_lr=cfg.clip_norm_lr if cfg.adaptive_enabled else 0.0,
+            min_clipping_norm=cfg.min_clipping_norm,
+            max_clipping_norm=cfg.max_clipping_norm,
+            max_sigma=cfg.max_sigma,
+        )
+        self.privacy = AdaptivePrivacyManager(pcfg)
+
+    def forward_sanitised(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (raw_embedding, sanitised_embedding). Raw kept for backward."""
+        self.bottom.train()
+        self.optim.zero_grad()
+        raw = self.bottom(x.to(self.device))
+        # Sanitisation is non-differentiable w.r.t. model params (clip+noise are
+        # detached noise); for backward we need gradients on ``raw`` and propagate
+        # them through the bottom network directly. The server therefore returns
+        # dL/d(sanitised), which we treat as dL/d(raw) up to the clip factor.
+        sanitised = self.privacy.sanitize(raw.detach())
+        return raw, sanitised
+
+    def backward_from_embedding_grad(self, raw: torch.Tensor, grad_sanitised: torch.Tensor) -> None:
+        """Backpropagate the server-provided gradient w.r.t. the embedding."""
+        raw.backward(grad_sanitised.to(raw.device))
+        self.optim.step()
+
+    def apply_lr(self, lr: float) -> None:
+        set_lr(self.optim, lr)
+
+
+class ServerState:
+    """Top-model and adaptive-tuner state held by the coordinating server."""
+
+    def __init__(self, cfg: RunConfig, device: torch.device, num_classes: int = 10):
+        self.cfg = cfg
+        self.device = device
+        self.top = TopNet(embedding_dim=cfg.embedding_dim, num_parties=2, num_classes=num_classes).to(device)
+        self.optim = torch.optim.Adam(self.top.parameters(), lr=cfg.initial_lr)
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward_backward(
+        self, embeddings: list[torch.Tensor], labels: torch.Tensor
+    ) -> Tuple[float, list[torch.Tensor]]:
+        """Run top model forward + backward, return (loss, grads-per-embedding)."""
+        self.top.train()
+        self.optim.zero_grad()
+        # Detach each embedding then re-attach grad so we can read dL/de per party.
+        emb_requires_grad = [e.detach().clone().requires_grad_(True) for e in embeddings]
+        concat = torch.cat(emb_requires_grad, dim=1)
+        logits = self.top(concat.to(self.device))
+        loss = self.criterion(logits, labels.to(self.device))
+        loss.backward()
+        self.optim.step()
+        grads = [e.grad.detach() for e in emb_requires_grad]
+        return float(loss.detach().cpu()), grads
+
+    @torch.no_grad()
+    def evaluate(self, embeddings: list[torch.Tensor], labels: torch.Tensor) -> Tuple[float, int, int]:
+        self.top.eval()
+        concat = torch.cat([e.to(self.device) for e in embeddings], dim=1)
+        logits = self.top(concat)
+        loss = self.criterion(logits, labels.to(self.device))
+        pred = logits.argmax(dim=1)
+        correct = int((pred == labels.to(self.device)).sum().cpu())
+        return float(loss.cpu()), correct, int(labels.size(0))
+
+    def apply_lr(self, lr: float) -> None:
+        set_lr(self.optim, lr)
+
+
+def build_session(cfg: RunConfig, device: torch.device | None = None):
+    """Return (train_loader, test_loader, parties, server) for a complete session."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(cfg.seed)
+    train_loader, test_loader, split_width = get_dataloaders(
+        cfg.dataset, batch_size=cfg.batch_size, seed=cfg.seed
+    )
+    parties = [PartyState(pid, split_width, cfg, device) for pid in range(2)]
+    server = ServerState(cfg, device)
+    return train_loader, test_loader, parties, server

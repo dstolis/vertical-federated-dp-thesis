@@ -14,22 +14,29 @@ from torch import nn
 class BottomNet(nn.Module):
     """Party-side bottom model: flattened MLP producing a fixed-size embedding."""
 
-    def __init__(self, input_width: int, embedding_dim: int = 64, image_height: int = 28):
+    def __init__(self, input_width: int, embedding_dim: int = 64, image_height: int = 28,
+                 layer_norm: bool = True):
         super().__init__()
         self.input_width = input_width
         self.image_height = image_height
         self.embedding_dim = embedding_dim
-        self.net = nn.Sequential(
+        self.layer_norm = layer_norm
+        layers = [
             nn.Flatten(),
             nn.Linear(image_height * input_width, 128),
             nn.ReLU(),
             nn.Linear(128, embedding_dim),
-            # LayerNorm stabilises IR scale so that clipping threshold C and
-            # injected noise sigma = z*C operate on a predictable signal range
-            # (roughly ||e||_2 ~ sqrt(d)). Without this, IR magnitudes drift
-            # with training and the adaptive-C loop chases a moving target.
-            nn.LayerNorm(embedding_dim),
-        )
+        ]
+        # LayerNorm stabilises IR scale so that clipping threshold C and
+        # injected noise sigma = z*C operate on a predictable signal range
+        # (roughly ||e||_2 ~ sqrt(d)). Without this, IR magnitudes drift
+        # with training and the adaptive-C loop chases a moving target.
+        # Set layer_norm=False for the ablation that removes it: the raw norm
+        # distribution regains a heavy tail but its scale explodes, so clipping
+        # to C destroys the signal (see scripts/run_seed_sweep.py).
+        if layer_norm:
+            layers.append(nn.LayerNorm(embedding_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, 1, H, W) -> (B, d)
         return self.net(x)

@@ -90,6 +90,8 @@ scripts/
 
 results/                       Latest matrix results + figures
 results_v6/, results_v7/       Cross-runtime parity runs
+results_seeds/                 z=2 cells at seeds 43, 44
+results_ablation_noln/         z=2 cells without the terminal LayerNorm
 data/                          MNIST / Fashion-MNIST cache (gitignored)
 ```
 
@@ -103,6 +105,33 @@ The full results matrix is 14 configurations:
 `python -m adaptive_dp_vfl --matrix` runs all 14 sequentially and writes
 per-config CSVs plus `all_results.csv` into `results/`. Figures are
 regenerated from that CSV with `scripts/plot_results.py`.
+
+## Robustness experiments
+
+Two further sweeps back the robustness section of the paper, both at the
+decisive `z = 2.0` cells:
+
+```bash
+# re-run the four z=2 cells at extra seeds  -> results_seeds/
+python scripts/run_seed_sweep.py seeds 43 44
+
+# same cells with the terminal LayerNorm removed -> results_ablation_noln/
+python scripts/run_seed_sweep.py noln
+
+# measure the IR norm distribution the clip update actually sees
+python scripts/collect_ir_norms.py
+```
+
+`collect_ir_norms.py` reports why quantile-matching clipping cannot work on
+normalised IRs. With LayerNorm the per-sample norm distribution is degenerate
+at warm-up (every embedding has norm exactly sqrt(d), s.d. 0), so there is no
+quantile structure for the update to track; after training the scale drifts an
+order of magnitude above the reachable clip ceiling while staying tight
+(CV ~ 2%), so every sample is clipped every round and the update ramps
+open-loop into its bound. Removing LayerNorm (`layer_norm=False` on
+`RunConfig`) restores a heavy tail (CV ~ 60%) but inflates the norms to
+O(10^6), so clipping to C destroys the signal and utility collapses for the
+fixed and adaptive configurations alike.
 
 ## Requirements
 

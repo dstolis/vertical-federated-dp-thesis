@@ -48,6 +48,7 @@ class RunConfig:
     # General
     batch_size: int = 64
     embedding_dim: int = 64
+    layer_norm: bool = True   # False = no-LayerNorm ablation on the bottom nets
     num_rounds: int = 40                # DP needs longer than non-private run
     seed: int = 42
 
@@ -67,7 +68,8 @@ class PartyState:
         self.party_id = party_id
         self.cfg = cfg
         self.device = device
-        self.bottom = BottomNet(input_width=input_width, embedding_dim=cfg.embedding_dim).to(device)
+        self.bottom = BottomNet(input_width=input_width, embedding_dim=cfg.embedding_dim,
+                                layer_norm=cfg.layer_norm).to(device)
         self.optim = torch.optim.Adam(self.bottom.parameters(), lr=cfg.initial_lr)
         pcfg = PrivacyConfig(
             noise_multiplier=cfg.noise_multiplier if cfg.dp_enabled else 0.0,

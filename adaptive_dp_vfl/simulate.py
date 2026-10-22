@@ -15,7 +15,7 @@ from typing import Iterable
 
 import torch
 
-from .task import RunConfig, build_session
+from .task import RunConfig, build_session_with_val, evaluate_clipped
 from .tuner import AdaptiveTuner, TunerConfig
 
 
@@ -26,7 +26,7 @@ def _iter_batches(loader: Iterable, device: torch.device):
 
 def run(cfg: RunConfig, out_csv: Path | None = None) -> list[dict]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, test_loader, parties, server = build_session(cfg, device)
+    train_loader, val_loader, test_loader, parties, server = build_session_with_val(cfg, device)
     tuner = AdaptiveTuner(TunerConfig(
         initial_lr=cfg.initial_lr,
         min_lr=cfg.min_lr,
@@ -76,6 +76,15 @@ def run(cfg: RunConfig, out_csv: Path | None = None) -> list[dict]:
             if seen >= 8:
                 break
 
+    elif cfg.match_warmup_order:
+        # Same number of batches drawn as the adaptive warm-up, without using
+        # them, so the data order of every later round matches it exactly.
+        seen = 0
+        for _ in _iter_batches(train_loader, device):
+            seen += 1
+            if seen >= 8:
+                break
+
     for rnd in range(1, cfg.num_rounds + 1):
         # --- training -----------------------------------------------------
         # Apply current LR to all optimisers (server top + both parties).
@@ -100,26 +109,13 @@ def run(cfg: RunConfig, out_csv: Path | None = None) -> list[dict]:
         train_loss = total_loss / max(1, num_batches)
 
         # --- evaluation ---------------------------------------------------
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for xl, xr, y in _iter_batches(test_loader, device):
-                embs = []
-                for p, x in zip(parties, [xl, xr]):
-                    p.bottom.eval()
-                    # At evaluation we still apply clipping (bounded sensitivity is
-                    # a property of the deployed model) but no fresh noise.
-                    raw = p.bottom(x)
-                    per_sample_norms = torch.norm(raw, p=2, dim=1)
-                    clip_factor = torch.clamp(
-                        p.privacy.clipping_norm / (per_sample_norms + 1e-12), max=1.0
-                    ).unsqueeze(1)
-                    embs.append(raw * clip_factor)
-                l, c, n = server.evaluate(embs, y)
-                val_loss += l * n
-                val_correct += c
-                val_total += n
-        val_loss /= max(1, val_total)
-        val_acc = val_correct / max(1, val_total)
+        # Clipping still applies at evaluation (bounded sensitivity is a
+        # property of the deployed model) but no fresh noise. Decisions
+        # (noise-lock, checkpoint selection) use the VALIDATION split only;
+        # test accuracy is logged per round for diagnostics and never read.
+        eval_clip = [p.privacy.clipping_norm for p in parties]
+        val_loss, val_acc = evaluate_clipped(parties, server, val_loader, device)
+        test_loss, test_acc = evaluate_clipped(parties, server, test_loader, device)
 
         # --- finalise adaptive clipping (one geometric C update per round) -
         for p in parties:
@@ -157,6 +153,7 @@ def run(cfg: RunConfig, out_csv: Path | None = None) -> list[dict]:
             best_state = {
                 "parties": [copy.deepcopy(p.bottom.state_dict()) for p in parties],
                 "server": copy.deepcopy(server.top.state_dict()),
+                "clip": list(eval_clip),
             }
 
         row = {
@@ -167,6 +164,8 @@ def run(cfg: RunConfig, out_csv: Path | None = None) -> list[dict]:
             "train_loss": train_loss,
             "val_loss": val_loss,
             "val_acc": val_acc,
+            "test_loss": test_loss,
+            "test_acc": test_acc,
             "best_val_acc_so_far": best_val_acc,
             "best_round_so_far": best_round,
             "lr": lr,
@@ -190,56 +189,47 @@ def run(cfg: RunConfig, out_csv: Path | None = None) -> list[dict]:
             )
         )
 
-    # --- restore best checkpoint and re-evaluate so the CSV's final row
-    # reflects the model we would actually deploy (not a noise-drifted copy).
-    if best_state is not None and best_round != rnd:
+    # --- restore the best checkpoint (selected on validation) together with
+    # the clipping thresholds it was evaluated with, then report it once on the
+    # test split. The final row (noise_lock = -1) is the reported model.
+    if best_state is not None:
         for p, sd in zip(parties, best_state["parties"]):
             p.bottom.load_state_dict(sd)
         server.top.load_state_dict(best_state["server"])
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for xl, xr, y in _iter_batches(test_loader, device):
-                embs = []
-                for p, x in zip(parties, [xl, xr]):
-                    p.bottom.eval()
-                    raw = p.bottom(x)
-                    per_sample_norms = torch.norm(raw, p=2, dim=1)
-                    clip_factor = torch.clamp(
-                        p.privacy.clipping_norm / (per_sample_norms + 1e-12), max=1.0
-                    ).unsqueeze(1)
-                    embs.append(raw * clip_factor)
-                l, c, n = server.evaluate(embs, y)
-                val_loss += l * n
-                val_correct += c
-                val_total += n
-        val_loss /= max(1, val_total)
-        restored_acc = val_correct / max(1, val_total)
+        for p, c in zip(parties, best_state["clip"]):
+            p.privacy.clipping_norm = c
+        r_val_loss, r_val_acc = evaluate_clipped(parties, server, val_loader, device)
+        r_test_loss, r_test_acc = evaluate_clipped(parties, server, test_loader, device)
+        if abs(r_val_acc - best_val_acc) > 1e-12:
+            print(f"WARNING: restored val_acc {r_val_acc:.6f} != selected {best_val_acc:.6f}")
         rows.append({
             "round": rnd + 1,
             "dataset": cfg.dataset,
             "mode": cfg.mode,
             "noise_multiplier": cfg.noise_multiplier if cfg.dp_enabled else 0.0,
             "train_loss": float("nan"),
-            "val_loss": val_loss,
-            "val_acc": restored_acc,
-            "best_val_acc_so_far": max(best_val_acc, restored_acc),
+            "val_loss": r_val_loss,
+            "val_acc": r_val_acc,
+            "test_loss": r_test_loss,
+            "test_acc": r_test_acc,
+            "best_val_acc_so_far": best_val_acc,
             "best_round_so_far": best_round,
             "lr": lr,
             "local_epochs": local_epochs,
-            "clipping_norm_A": parties[0].privacy.clipping_norm,
-            "clipping_norm_B": parties[1].privacy.clipping_norm,
+            "clipping_norm_A": best_state["clip"][0],
+            "clipping_norm_B": best_state["clip"][1],
             "epsilon": eps,
-            "noise_lock": -1,  # sentinel: post-training restored eval
+            "noise_lock": -1,  # sentinel: restored best-validation model
         })
         print(
             f"[{cfg.dataset}/{cfg.mode}/z={cfg.noise_multiplier}] "
-            f"RESTORED best r{best_round}: val_acc={restored_acc:.4f}"
+            f"RESTORED best r{best_round}: val_acc={r_val_acc:.4f} test_acc={r_test_acc:.4f}"
         )
 
     if out_csv is not None:
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         with out_csv.open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
             w.writeheader()
             w.writerows(rows)
     return rows

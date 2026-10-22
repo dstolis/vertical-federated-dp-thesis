@@ -24,7 +24,7 @@ import torch
 from .data import get_dataloaders
 from .models import BottomNet, TopNet, set_lr
 from .privacy_flower import FlowerDPConfig, FlowerServerAdaptiveClipping, FlowerStylePartyPrivacy
-from .task import RunConfig, ServerState
+from .task import RunConfig, ServerState, evaluate_clipped, load_data
 from .tuner import AdaptiveTuner, TunerConfig
 
 
@@ -63,9 +63,7 @@ def run_flower_strategy(cfg: RunConfig, out_csv: Path | None = None,
                         initial_clipping_norm: float = 0.1) -> list[dict]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.seed)
-    train_loader, test_loader, split_width = get_dataloaders(
-        cfg.dataset, batch_size=cfg.batch_size, seed=cfg.seed
-    )
+    train_loader, val_loader, test_loader, split_width = load_data(cfg)
     fcfg = FlowerDPConfig(
         noise_multiplier=cfg.noise_multiplier if cfg.dp_enabled else 0.0,
         initial_clipping_norm=initial_clipping_norm,
@@ -123,24 +121,10 @@ def run_flower_strategy(cfg: RunConfig, out_csv: Path | None = None,
         train_loss = total_loss / max(1, num_batches)
 
         # --- validation ---
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for xl, xr, y in _iter_batches(test_loader, device):
-                embs = []
-                for p, x in zip(parties, [xl, xr]):
-                    p.bottom.eval()
-                    raw = p.bottom(x)
-                    per = torch.norm(raw, p=2, dim=1)
-                    cf = torch.clamp(
-                        p.privacy.clipping_norm / (per + 1e-12), max=1.0
-                    ).unsqueeze(1)
-                    embs.append(raw * cf)
-                l, c, n = server.evaluate(embs, y)
-                val_loss += l * n
-                val_correct += c
-                val_total += n
-        val_loss /= max(1, val_total)
-        val_acc = val_correct / max(1, val_total)
+        # Selection signal on the validation split; test logged only.
+        eval_clip = [p.privacy.clipping_norm for p in parties]
+        val_loss, val_acc = evaluate_clipped(parties, server, val_loader, device)
+        test_loss, test_acc = evaluate_clipped(parties, server, test_loader, device)
 
         # --- server-side adaptive clipping update ---
         clipped_counts, total_counts = [], []
@@ -170,12 +154,14 @@ def run_flower_strategy(cfg: RunConfig, out_csv: Path | None = None,
             best_state = {
                 "parties": [copy.deepcopy(p.bottom.state_dict()) for p in parties],
                 "server": copy.deepcopy(server.top.state_dict()),
+                "clip": list(eval_clip),
             }
 
         row = {
             "round": rnd, "dataset": cfg.dataset, "mode": "flower_adaptive",
             "noise_multiplier": cfg.noise_multiplier if cfg.dp_enabled else 0.0,
             "train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc,
+            "test_loss": test_loss, "test_acc": test_acc,
             "best_val_acc_so_far": best_val_acc, "best_round_so_far": best_round,
             "lr": lr, "local_epochs": local_epochs,
             "clipping_norm_A": parties[0].privacy.clipping_norm,
@@ -193,39 +179,34 @@ def run_flower_strategy(cfg: RunConfig, out_csv: Path | None = None,
         )
 
     # --- best-checkpoint restore ---
-    if best_state is not None and best_round != rnd:
+    # Restore the best-validation checkpoint WITH the clipping threshold it was
+    # evaluated at (the earlier version re-evaluated at the final threshold),
+    # then report it once on the test split.
+    if best_state is not None:
         for p, sd in zip(parties, best_state["parties"]):
             p.bottom.load_state_dict(sd)
         server.top.load_state_dict(best_state["server"])
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for xl, xr, y in _iter_batches(test_loader, device):
-                embs = []
-                for p, x in zip(parties, [xl, xr]):
-                    p.bottom.eval()
-                    raw = p.bottom(x)
-                    per = torch.norm(raw, p=2, dim=1)
-                    cf = torch.clamp(
-                        p.privacy.clipping_norm / (per + 1e-12), max=1.0
-                    ).unsqueeze(1)
-                    embs.append(raw * cf)
-                l, c, n = server.evaluate(embs, y)
-                val_loss += l * n
-                val_correct += c
-                val_total += n
-        val_loss /= max(1, val_total)
-        restored_acc = val_correct / max(1, val_total)
+        for p, c in zip(parties, best_state["clip"]):
+            p.privacy.set_clipping_norm(c)
+        r_val_loss, r_val_acc = evaluate_clipped(parties, server, val_loader, device)
+        r_test_loss, r_test_acc = evaluate_clipped(parties, server, test_loader, device)
+        if abs(r_val_acc - best_val_acc) > 1e-12:
+            print(f"WARNING: restored val_acc {r_val_acc:.6f} != selected {best_val_acc:.6f}")
         rows.append({**rows[-1],
                      "round": rnd + 1, "train_loss": float("nan"),
-                     "val_loss": val_loss, "val_acc": restored_acc,
-                     "best_val_acc_so_far": max(best_val_acc, restored_acc),
+                     "val_loss": r_val_loss, "val_acc": r_val_acc,
+                     "test_loss": r_test_loss, "test_acc": r_test_acc,
+                     "best_val_acc_so_far": best_val_acc, "best_round_so_far": best_round,
+                     "clipping_norm_A": best_state["clip"][0],
+                     "clipping_norm_B": best_state["clip"][1],
                      "noise_lock": -1})
-        print(f"[{cfg.dataset}/flower/z={cfg.noise_multiplier}] RESTORED r{best_round}: {restored_acc:.4f}")
+        print(f"[{cfg.dataset}/flower/z={cfg.noise_multiplier}] RESTORED r{best_round}: "
+              f"val={r_val_acc:.4f} test={r_test_acc:.4f}")
 
     if out_csv is not None:
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         with out_csv.open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
             w.writeheader()
             w.writerows(rows)
     return rows

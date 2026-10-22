@@ -24,10 +24,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from adaptive_dp_vfl.task import RunConfig, build_session
+from adaptive_dp_vfl.task import RunConfig, build_session_with_val
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "results_ablation_noln"
+OUT = ROOT / "results_camera_ready" / "ir_norms"
 
 
 def party_a_norms(parties, loader, device, limit_batches: int | None = None):
@@ -45,9 +45,11 @@ def party_a_norms(parties, loader, device, limit_batches: int | None = None):
 def measure(layer_norm: bool, rounds: int, device: torch.device):
     cfg = RunConfig(dataset="mnist", mode="dp", noise_multiplier=2.0, seed=42,
                     layer_norm=layer_norm)
-    train_loader, test_loader, parties, server = build_session(cfg, device)
+    train_loader, val_loader, _test_loader, parties, server = build_session_with_val(cfg, device)
 
-    warm = party_a_norms(parties, train_loader, device, limit_batches=8)
+    # Warm-up distribution: all 10,000 validation samples through the
+    # freshly initialised bottom model (the state in which C_0 is seeded).
+    warm = party_a_norms(parties, val_loader, device)
 
     for _ in range(rounds):
         for xl, xr, y in train_loader:
@@ -60,7 +62,7 @@ def measure(layer_norm: bool, rounds: int, device: torch.device):
             for p, raw, g in zip(parties, raws, grads):
                 p.backward_from_embedding_grad(raw, g)
 
-    trained = party_a_norms(parties, test_loader, device)
+    trained = party_a_norms(parties, val_loader, device)
     return warm, trained
 
 
@@ -82,6 +84,7 @@ def main() -> None:
     for layer_norm, tag in ((True, "layernorm"), (False, "nolayernorm")):
         warm, trained = measure(layer_norm, args.rounds, device)
         np.save(OUT / f"norms_{tag}.npy", trained)
+        np.save(OUT / f"norms_{tag}_warmup.npy", warm)
         describe(f"{tag} (warm-up)", warm)
         describe(f"{tag} (trained)", trained)
 

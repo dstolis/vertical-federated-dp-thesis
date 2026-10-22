@@ -13,7 +13,7 @@ from typing import Iterator, Tuple
 import torch
 from torch import nn
 
-from .data import get_dataloaders
+from .data import get_dataloaders, get_dataloaders_with_val
 from .models import BottomNet, TopNet, set_lr
 from .privacy import AdaptivePrivacyManager, PrivacyConfig
 
@@ -51,6 +51,15 @@ class RunConfig:
     layer_norm: bool = True   # False = no-LayerNorm ablation on the bottom nets
     num_rounds: int = 40                # DP needs longer than non-private run
     seed: int = 42
+    # Hold out a validation split from the training data for checkpoint
+    # selection and the noise-lock; the test split is then used only to
+    # report the selected model. False reproduces the original protocol.
+    val_split: bool = True
+    val_size: int = 10_000
+    # Fixed-threshold control only: draw the same data order as the adaptive
+    # configuration, whose warm-up pass consumes one shuffle of the training
+    # loader before round 1.
+    match_warmup_order: bool = False
 
     @property
     def dp_enabled(self) -> bool:
@@ -142,6 +151,53 @@ class ServerState:
 
     def apply_lr(self, lr: float) -> None:
         set_lr(self.optim, lr)
+
+
+def load_data(cfg: RunConfig):
+    """Return (train_loader, val_loader, test_loader, split_width).
+
+    With ``cfg.val_split`` the validation loader is a held-out part of the
+    training data; without it, validation falls back to the test split (the
+    original protocol)."""
+    if cfg.val_split:
+        return get_dataloaders_with_val(cfg.dataset, batch_size=cfg.batch_size,
+                                        seed=cfg.seed, val_size=cfg.val_size)
+    train_loader, test_loader, split_width = get_dataloaders(
+        cfg.dataset, batch_size=cfg.batch_size, seed=cfg.seed)
+    return train_loader, test_loader, test_loader, split_width
+
+
+def build_session_with_val(cfg: RunConfig, device: torch.device | None = None):
+    """Return (train_loader, val_loader, test_loader, parties, server)."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(cfg.seed)
+    train_loader, val_loader, test_loader, split_width = load_data(cfg)
+    parties = [PartyState(pid, split_width, cfg, device) for pid in range(2)]
+    server = ServerState(cfg, device)
+    return train_loader, val_loader, test_loader, parties, server
+
+
+@torch.no_grad()
+def evaluate_clipped(parties, server, loader, device, clip_norms=None) -> Tuple[float, float]:
+    """Accuracy of the deployed model: each party's embedding is clipped to its
+    threshold (bounded sensitivity) but no fresh noise is added.
+
+    ``clip_norms`` overrides the thresholds (used when re-evaluating a restored
+    checkpoint at the threshold it was selected with)."""
+    total_loss, correct, total = 0.0, 0, 0
+    for xl, xr, y in loader:
+        embs = []
+        for i, (p, x) in enumerate(zip(parties, [xl, xr])):
+            p.bottom.eval()
+            raw = p.bottom(x.to(device))
+            c = clip_norms[i] if clip_norms is not None else p.privacy.clipping_norm
+            per = torch.norm(raw, p=2, dim=1)
+            embs.append(raw * torch.clamp(c / (per + 1e-12), max=1.0).unsqueeze(1))
+        l, k, n = server.evaluate(embs, y.to(device))
+        total_loss += l * n
+        correct += k
+        total += n
+    return total_loss / max(1, total), correct / max(1, total)
 
 
 def build_session(cfg: RunConfig, device: torch.device | None = None):
